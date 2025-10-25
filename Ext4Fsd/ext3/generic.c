@@ -273,15 +273,34 @@ Ext2DropBH(IN PEXT2_VCB Vcb)
         SetFlag(Vcb->Flags, VCB_BEING_DROPPED);
         Ext2DropGroupBH(Vcb);
 
-        while (!IsListEmpty(&Vcb->bd.bd_bh_free)) {
+        while (!IsListEmpty(&Vcb->bd.bd_bh_free) ||
+               !IsListEmpty(&Vcb->bd.bd_bh_deferred)) {
             struct buffer_head *bh;
             PLIST_ENTRY         l;
-            l = RemoveHeadList(&Vcb->bd.bd_bh_free);
+            BOOLEAN             busy = FALSE;
+
+            if (!IsListEmpty(&Vcb->bd.bd_bh_free)) {
+                l = RemoveHeadList(&Vcb->bd.bd_bh_free);
+            } else {
+                l = RemoveHeadList(&Vcb->bd.bd_bh_deferred);
+            }
+
             bh = CONTAINING_RECORD(l, struct buffer_head, b_link);
             InitializeListHead(&bh->b_link);
+
             if (0 == atomic_read(&bh->b_count)) {
                 buffer_head_remove(&Vcb->bd, bh);
                 free_buffer_head(bh);
+                continue;
+            } else {
+                /* put it back to deferred queue for late release */
+                busy = TRUE;
+            }
+
+            InsertTailList(&Vcb->bd.bd_bh_deferred, &bh->b_link);
+
+            if (busy) {
+                break;
             }
         }
 

@@ -559,6 +559,7 @@ struct block_device {
     ERESOURCE               bd_bh_lock; /* lock for bh tree and reaper list */
     struct rb_root          bd_bh_root; /* buffer_head red-black tree root */
     LIST_ENTRY              bd_bh_free; /* reaper list */
+    LIST_ENTRY              bd_bh_deferred; /* buffer heads deferred from reclaim */
     KEVENT                  bd_bh_notify; /* notification event for cleanup */
 };
 
