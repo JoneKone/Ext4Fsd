@@ -316,16 +316,22 @@ NTSTATUS
 Ext2FlushVcb(IN PEXT2_VCB Vcb)
 {
     LARGE_INTEGER        s = {0}, o;
-    struct ext4_sb_info *sbi = &Vcb->sbi;
     struct rb_node      *node;
     struct buffer_head  *bh;
+
+    typedef struct _EXT2_BUSY_RANGE {
+        LARGE_INTEGER   Start;
+        ULONG           Length;
+    } EXT2_BUSY_RANGE, *PEXT2_BUSY_RANGE;
+
+    PEXT2_BUSY_RANGE     BusyRanges = NULL;
+    ULONG                BusyCount = 0;
+    ULONG                BusyIndex = 0;
 
     if (!IsFlagOn(Vcb->Flags, VCB_GD_LOADED)) {
         CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
         goto errorout;
     }
-
-    ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->MainResource));
 
     __try {
 
@@ -338,36 +344,62 @@ Ext2FlushVcb(IN PEXT2_VCB Vcb)
         /* drop unused bh */
         Ext2DropBH(Vcb);
 
-        /* flush volume with all outstanding bh skipped */
-
-        node = rb_first(&Vcb->bd.bd_bh_root);
-        while (node) {
-
-            bh = container_of(node, struct buffer_head, b_rb_node);
-            node = rb_next(node);
-
-            o.QuadPart = bh->b_blocknr << BLOCK_BITS;
-            ASSERT(o.QuadPart >= s.QuadPart);
-
-            if (o.QuadPart == s.QuadPart) {
-                s.QuadPart = s.QuadPart + bh->b_size;
-                continue;
-            }
-
-            if (o.QuadPart > s.QuadPart) {
-                Ext2FlushRange(Vcb, s, o);
-                s.QuadPart = (bh->b_blocknr << BLOCK_BITS) + bh->b_size;
-                continue;
-            }
+        /* count outstanding bh entries */
+        for (node = rb_first(&Vcb->bd.bd_bh_root);
+             node != NULL;
+             node = rb_next(node)) {
+            BusyCount++;
         }
 
-        o = Vcb->PartitionInformation.PartitionLength;
-        Ext2FlushRange(Vcb, s, o);
+        if (BusyCount) {
+            BusyRanges = Ext2AllocatePool(
+                              PagedPool,
+                              BusyCount * sizeof(EXT2_BUSY_RANGE),
+                              'rF2E');
+            if (BusyRanges) {
+                for (node = rb_first(&Vcb->bd.bd_bh_root);
+                     node != NULL && BusyIndex < BusyCount;
+                     node = rb_next(node)) {
+
+                    bh = container_of(node, struct buffer_head, b_rb_node);
+                    BusyRanges[BusyIndex].Start.QuadPart = bh->b_blocknr << BLOCK_BITS;
+                    BusyRanges[BusyIndex].Length = bh->b_size;
+                    BusyIndex++;
+                }
+            } else {
+                BusyCount = 0;
+            }
+        }
 
     } __finally {
 
         ExReleaseResourceLite(&Vcb->bd.bd_bh_lock);
         ExReleaseResourceLite(&Vcb->sbi.s_gd_lock);
+    }
+
+    s.QuadPart = 0;
+
+    if (BusyRanges && BusyIndex) {
+        ULONG i;
+        for (i = 0; i < BusyIndex; i++) {
+            o = BusyRanges[i].Start;
+            if (o.QuadPart > s.QuadPart) {
+                Ext2FlushRange(Vcb, s, o);
+                s.QuadPart = BusyRanges[i].Start.QuadPart + BusyRanges[i].Length;
+            } else {
+                LONGLONG BusyEnd = BusyRanges[i].Start.QuadPart + BusyRanges[i].Length;
+                if (BusyEnd > s.QuadPart) {
+                    s.QuadPart = BusyEnd;
+                }
+            }
+        }
+    }
+
+    o = Vcb->PartitionInformation.PartitionLength;
+    Ext2FlushRange(Vcb, s, o);
+
+    if (BusyRanges) {
+        Ext2FreePool(BusyRanges, 'rF2E');
     }
 
 errorout:
