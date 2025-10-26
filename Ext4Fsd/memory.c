@@ -2510,6 +2510,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         Vcb->bd.bd_priv = (void *) Vcb;
         memset(&Vcb->bd.bd_bh_root, 0, sizeof(struct rb_root));
         InitializeListHead(&Vcb->bd.bd_bh_free);
+        InitializeListHead(&Vcb->bd.bd_bh_deferred);
         ExInitializeResourceLite(&Vcb->bd.bd_bh_lock);
         KeInitializeEvent(&Vcb->bd.bd_bh_notify,
                            NotificationEvent, TRUE);
@@ -3142,16 +3143,51 @@ Ext2McbReaperThread(
 /* get buffer heads from global Vcb BH list */
 
 BOOLEAN
-Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
+Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head, PBOOLEAN BusyDeferred)
 {
     struct buffer_head *bh = NULL;
     PLIST_ENTRY         next = NULL;
     LARGE_INTEGER       start, now;
     BOOLEAN             wake = FALSE;
+    BOOLEAN             busy = FALSE;
 
     KeQuerySystemTime(&start);
 
     ExAcquireResourceExclusiveLite(&Vcb->bd.bd_bh_lock, TRUE);
+
+    while (!IsListEmpty(&Vcb->bd.bd_bh_deferred)) {
+
+        next = RemoveHeadList(&Vcb->bd.bd_bh_deferred);
+        bh = CONTAINING_RECORD(next, struct buffer_head, b_link);
+
+        {
+            LONG refcount = atomic_read(&bh->b_count);
+
+            if (refcount) {
+                ULONG deferred = 1; /* include current entry */
+                PLIST_ENTRY cursor;
+
+                for (cursor = Vcb->bd.bd_bh_deferred.Flink;
+                     cursor != &Vcb->bd.bd_bh_deferred;
+                     cursor = cursor->Flink) {
+                    deferred++;
+                }
+
+                DEBUG(DL_ERR|DL_BH|DL_WRN, (
+                    "bhReaper: deferred list busy bh=%p blk=%I64u count=%ld outstanding=%lu thread=%p\n",
+                    bh,
+                    (unsigned __int64)bh->b_blocknr,
+                    refcount,
+                    deferred,
+                    PsGetCurrentThread()));
+                InsertTailList(&Vcb->bd.bd_bh_deferred, &bh->b_link);
+                busy = TRUE;
+                break;
+            }
+
+            InsertTailList(&Vcb->bd.bd_bh_free, &bh->b_link);
+        }
+    }
 
     while (!IsListEmpty(&Vcb->bd.bd_bh_free)) {
 
@@ -3162,10 +3198,31 @@ Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
 
         next = RemoveHeadList(&Vcb->bd.bd_bh_free);
         bh = CONTAINING_RECORD(next, struct buffer_head, b_link);
-        if (atomic_read(&bh->b_count)) {
-            InitializeListHead(&bh->b_link);
-            /* to be inserted by brelse */
-            continue;
+        {
+            LONG refcount = atomic_read(&bh->b_count);
+
+            if (refcount) {
+                ULONG deferred = 1; /* include the bh being deferred */
+                PLIST_ENTRY cursor;
+
+                for (cursor = Vcb->bd.bd_bh_deferred.Flink;
+                     cursor != &Vcb->bd.bd_bh_deferred;
+                     cursor = cursor->Flink) {
+                    deferred++;
+                }
+
+                DEBUG(DL_ERR|DL_BH|DL_WRN, (
+                    "bhReaper: deferred busy bh=%p blk=%I64u count=%ld flags=%lx outstanding=%lu thread=%p\n",
+                    bh,
+                    (unsigned __int64)bh->b_blocknr,
+                    refcount,
+                    bh->b_state,
+                    deferred,
+                    PsGetCurrentThread()));
+                InsertTailList(&Vcb->bd.bd_bh_deferred, &bh->b_link);
+                busy = TRUE;
+                continue;
+            }
         }
 
         if ( IsFlagOn(Vcb->Flags, VCB_BEING_DROPPED) ||
@@ -3179,11 +3236,16 @@ Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
         }
     }
 
-    wake = IsListEmpty(&Vcb->bd.bd_bh_free);
+    wake = IsListEmpty(&Vcb->bd.bd_bh_free) &&
+           IsListEmpty(&Vcb->bd.bd_bh_deferred);
     ExReleaseResourceLite(&Vcb->bd.bd_bh_lock);
 
     if (wake)
         KeSetEvent(&Vcb->bd.bd_bh_notify, 0, FALSE);
+
+    if (BusyDeferred) {
+        *BusyDeferred = busy;
+    }
 
     return IsFlagOn(Vcb->Flags, VCB_BEING_DROPPED);
 }
@@ -3239,12 +3301,30 @@ Ext2bhReaperThread(
             ExAcquireResourceSharedLite(&Ext2Global->Resource, TRUE);
             GlobalAcquired = TRUE;
             /* search all Vcb to get unused resources freed to system */
-            for (Link = Ext2Global->VcbList.Flink;
-                 Link != &(Ext2Global->VcbList);
-                 Link = Link->Flink ) {
+            {
+                BOOLEAN NextNonWait = FALSE;
 
-                Vcb = CONTAINING_RECORD(Link, EXT2_VCB, Next);
-                NonWait = Ext2QueryUnusedBH(Vcb, &List);
+                for (Link = Ext2Global->VcbList.Flink;
+                     Link != &(Ext2Global->VcbList);
+                     Link = Link->Flink ) {
+
+                    BOOLEAN BusyDeferred = FALSE;
+
+                    Vcb = CONTAINING_RECORD(Link, EXT2_VCB, Next);
+                    if (Ext2QueryUnusedBH(Vcb, &List, &BusyDeferred)) {
+                        NextNonWait = TRUE;
+                    }
+
+                    if (BusyDeferred) {
+                        DEBUG(DL_ERR|DL_BH|DL_WRN, (
+                            "bhReaper: Vcb=%p deferred busy bh detected thread=%p\n",
+                            Vcb,
+                            PsGetCurrentThread()));
+                        NextNonWait = TRUE;
+                    }
+                }
+
+                NonWait = NextNonWait;
             }
             DidNothing = IsListEmpty(&List);
             if (DidNothing) {
@@ -3260,6 +3340,11 @@ Ext2bhReaperThread(
                 Link = RemoveHeadList(&List);
                 bh = CONTAINING_RECORD(Link, struct buffer_head, b_link);
                 ASSERT(0 == atomic_read(&bh->b_count));
+                DEBUG(DL_BH, (
+                    "bhReaper: reclaiming bh=%p blk=%I64u thread=%p\n",
+                    bh,
+                    (unsigned __int64)bh->b_blocknr,
+                    PsGetCurrentThread()));
                 free_buffer_head(bh);
             }
         }
