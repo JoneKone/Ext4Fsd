@@ -66,6 +66,9 @@ Ext2SaveSuper(
     LONGLONG    offset;
     BOOLEAN     rc;
 
+    ext3_blocks_count_set(SUPER_BLOCK, Vcb->TotalBlocks);
+    ext3_r_blocks_count_set(SUPER_BLOCK, Vcb->ReservedBlocks);
+    ext3_free_blocks_count_set(SUPER_BLOCK, Vcb->FreeBlocks);
     ext4_superblock_csum_set(&Vcb->sb);
     offset = (LONGLONG) SUPER_BLOCK_OFFSET;
     rc = Ext2SaveBuffer( IrpContext,
@@ -121,6 +124,10 @@ Ext2RefreshSuper (
         else
             Vcb->McbTree->CreationTime = Ext2GetInodeTime(Vcb->McbTree->Inode.i_ctime, Vcb->McbTree->Inode.i_ctime_extra);
     }
+
+    Vcb->FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
+    Vcb->TotalBlocks = ext3_blocks_count(SUPER_BLOCK);
+    Vcb->ReservedBlocks = ext3_r_blocks_count(SUPER_BLOCK);
 
     return TRUE;
 }
@@ -962,7 +969,10 @@ Ext2UpdateVcbStat(
 )
 {
     Vcb->SuperBlock->s_free_inodes_count = ext4_count_free_inodes(&Vcb->sb);
-    ext3_free_blocks_count_set(SUPER_BLOCK, ext4_count_free_blocks(&Vcb->sb));
+    Vcb->FreeBlocks = ext4_count_free_blocks(&Vcb->sb);
+    ext3_free_blocks_count_set(SUPER_BLOCK, Vcb->FreeBlocks);
+    ext3_blocks_count_set(SUPER_BLOCK, Vcb->TotalBlocks);
+    ext3_r_blocks_count_set(SUPER_BLOCK, Vcb->ReservedBlocks);
     Ext2SaveSuper(IrpContext, Vcb);
 }
 

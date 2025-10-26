@@ -756,6 +756,9 @@ typedef struct _EXT2_VCB {
     ULONG                       max_data_blocks;
     loff_t                      max_bitmap_bytes;
     loff_t                      max_bytes;
+    ext4_fsblk_t                TotalBlocks;
+    ext4_fsblk_t                ReservedBlocks;
+    ext4_fsblk_t                FreeBlocks;
 } EXT2_VCB, *PEXT2_VCB;
 
 //

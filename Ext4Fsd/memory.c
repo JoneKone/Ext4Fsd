@@ -2618,6 +2618,9 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         Vcb->max_bitmap_bytes = ext3_max_bitmap_size(BLOCK_BITS,
                                 has_huge_files);
         Vcb->max_bytes = ext3_max_size(BLOCK_BITS, has_huge_files);
+        Vcb->TotalBlocks = ext3_blocks_count(sb);
+        Vcb->ReservedBlocks = ext3_r_blocks_count(sb);
+        Vcb->FreeBlocks = ext3_free_blocks_count(sb);
 
         /* calculate maximum file bocks ... */
         {
