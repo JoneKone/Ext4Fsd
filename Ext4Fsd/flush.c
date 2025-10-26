@@ -56,6 +56,8 @@ Ext2FlushFile (
 )
 {
     IO_STATUS_BLOCK     IoStatus = {0};
+    SECTION_OBJECT_POINTERS *SectionObject = NULL;
+    BOOLEAN ResourceReleased = FALSE;
 
     ASSERT(Fcb != NULL);
     ASSERT((Fcb->Identifier.Type == EXT2FCB) &&
@@ -91,12 +93,24 @@ Ext2FlushFile (
         DEBUG(DL_INF, ( "Ext2FlushFile: Flushing File Inode=%xh %S ...\n",
                         Fcb->Inode->i_ino, Fcb->Mcb->ShortName.Buffer));
 
-        CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
-        ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        SectionObject = &Fcb->SectionObject;
+
+        ExReleaseResourceLite(&Fcb->MainResource);
+        ResourceReleased = TRUE;
+
+        CcFlushCache(SectionObject, NULL, 0, &IoStatus);
 
     } __finally {
 
         /* do cleanup here */
+
+        if (ResourceReleased) {
+            ExAcquireResourceExclusiveLite(&Fcb->MainResource, TRUE);
+
+            if (NT_SUCCESS(IoStatus.Status)) {
+                ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+            }
+        }
     }
 
     return IoStatus.Status;
@@ -154,6 +168,7 @@ Ext2Flush (IN PEXT2_IRP_CONTEXT IrpContext)
     PDEVICE_OBJECT          DeviceObject = NULL;
 
     BOOLEAN                 MainResourceAcquired = FALSE;
+    BOOLEAN                 VcbResourceReleased = FALSE;
 
     __try {
 
@@ -205,14 +220,27 @@ Ext2Flush (IN PEXT2_IRP_CONTEXT IrpContext)
         if (FcbOrVcb->Identifier.Type == EXT2VCB) {
 
             Ext2VerifyVcb(IrpContext, Vcb);
+            ExReleaseResourceLite(&FcbOrVcb->MainResource);
+            VcbResourceReleased = TRUE;
+
             Status = Ext2FlushFiles(IrpContext, (PEXT2_VCB)(FcbOrVcb), FALSE);
+
+            ExAcquireResourceExclusiveLite(&FcbOrVcb->MainResource, TRUE);
+            VcbResourceReleased = FALSE;
+
             if (NT_SUCCESS(Status)) {
                 __leave;
             }
 
             /* TO INVESTIGATE: Ext2FlushFiles will always return STATUS_SUCCESS so Ext2FlushVolume will never be called? */
 
+            ExReleaseResourceLite(&FcbOrVcb->MainResource);
+            VcbResourceReleased = TRUE;
+
             Status = Ext2FlushVolume(IrpContext, (PEXT2_VCB)(FcbOrVcb), FALSE);
+
+            ExAcquireResourceExclusiveLite(&FcbOrVcb->MainResource, TRUE);
+            VcbResourceReleased = FALSE;
 
             if (NT_SUCCESS(Status) && IsFlagOn(Vcb->Volume->Flags, FO_FILE_MODIFIED)) {
                 ClearFlag(Vcb->Volume->Flags, FO_FILE_MODIFIED);
@@ -235,6 +263,11 @@ Ext2Flush (IN PEXT2_IRP_CONTEXT IrpContext)
                        FsRtlNumberOfRunsInLargeMcb(&Vcb->Extents)));
 
     } __finally {
+
+        if (VcbResourceReleased) {
+            ExAcquireResourceExclusiveLite(&FcbOrVcb->MainResource, TRUE);
+            VcbResourceReleased = FALSE;
+        }
 
         if (MainResourceAcquired) {
             ExReleaseResourceLite(&FcbOrVcb->MainResource);

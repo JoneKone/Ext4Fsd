@@ -66,6 +66,8 @@ Ext2ShutDown (IN PEXT2_IRP_CONTEXT IrpContext)
 
                 if (IsMounted(Vcb)) {
 
+                    BOOLEAN VcbMainReleased = FALSE;
+
                     /* update fs write time */
                     KeQuerySystemTime(&SysTime);
                     Ext2TimeToSecondsSince1970(&SysTime, &LinuxTime.LowPart, &LinuxTime.HighPart);
@@ -76,11 +78,19 @@ Ext2ShutDown (IN PEXT2_IRP_CONTEXT IrpContext)
                     Vcb->SuperBlock->s_mnt_count++;
                     Ext2SaveSuper(IrpContext, Vcb);
 
+                    ExReleaseResourceLite(&Vcb->MainResource);
+                    VcbMainReleased = TRUE;
+
                     /* flush dirty cache for all files */
                     Ext2FlushFiles(IrpContext, Vcb, TRUE);
 
                     /* flush volume stream's cache to disk */
                     Ext2FlushVolume(IrpContext, Vcb, TRUE);
+
+                    if (VcbMainReleased) {
+                        ExAcquireResourceExclusiveLite(&Vcb->MainResource, TRUE);
+                        VcbMainReleased = FALSE;
+                    }
 
                     /* send shutdown request to underlying disk */
                     Ext2DiskShutDown(Vcb);
